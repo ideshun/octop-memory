@@ -155,6 +155,13 @@ capture → RawEvent → extraction → Candidate → promotion → AtomCard →
 
 Candidates may promote, merge, drop, or enter conflict/needs_review automatically; not every candidate needs a human.
 `Memory.store()` needs no LLM and creates manual RawEvent/Candidate/AtomCard plus a leaf reference.
+`Memory.store(kind=...)` and `MemoryService.save(kind=...)` preserve the caller's Fact/Preference/Decision/Task
+as Candidate.candidate_type; omission remains Fact. The manual path does not infer a kind or call an LLM.
+Topic/entity type remains independent. Non-Fact kinds on directory nodes and ConflictCandidate manual promotion
+are rejected before writes; conflict candidates still require the existing review path. Evidence, transaction,
+user provenance, and asynchronous review scheduling are preserved. Dashboard kind/filter/statistics already
+read the linked candidate. This additive API is unreleased; Harness must load a supporting memory version
+before sending typed saves. Existing stored facts are unchanged; Task storage is not reminder scheduling.
 `root → branch → leaf` is an organization tree; leaf `atom_id` projects the canonical assertion without a second fact copy.
 Manual correction creates a successor, supersedes an active old atom only, and journals `user_edit`, without fabricating conversation evidence.
 Absolute event times use aware UTC.
@@ -253,6 +260,11 @@ current session/thread scope excludes that conversation's raw. The legacy `recal
 SQLite isolates namespaces with table prefixes; PostgreSQL uses shared `octop_memory` schema and namespace-first keys.
 Chroma/Qdrant are optional indexes, not replacements for relational data/transactions; real vector-backend validation is still missing.
 LangGraph checkpoints optionally persist execution state; `checkpoint_ns` differs from the memory namespace.
+SQLite retention selects checkpoints by count or age, then keeps the ancestry and writes needed by each survivor.
+The saver serializes planning and deletion in a single transaction per thread. Only a survivor that can restore
+without its deleted parent loses that link. IDs, payloads and pending writes stay intact.
+Offline migration honors its caller's explicit `protected_ids` before evaluating replay dependencies.
+Harness uses scheduled SQLite cleanup with `skip_pending=True`, leaving checkpoints with pending head work intact.
 
 Each SQLite backend has one connection and a reentrant lock across complete SQL/results, transactions, maintenance, and close.
 Failed standalone writes roll back; close waits for operations and never reopens. Different backends have independent locks;

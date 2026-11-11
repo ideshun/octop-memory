@@ -66,7 +66,7 @@ Existing installations should read the [rename migration guide](docs/integration
 pip install octop-memory
 ```
 
-Current release: **1.0.3**. See the [release notes](CHANGELOG.md).
+Current release: **1.0.4**. See the [release notes](CHANGELOG.md).
 
 ```python
 from octop_memory import Memory, MemoryService
@@ -89,6 +89,12 @@ print(result.rendered)
 This creates a local database. Use terms present in the stored text for a minimal FTS example. `Memory.search()` searches archived conversation messages; it is a separate API from fact recall.
 
 ### Optional dependencies
+
+**Since 1.0.4:** explicit Python saves accept `kind="Fact"`, `"Preference"`, `"Decision"`, or `"Task"`:
+`MemoryService(memory).save("The user prefers Chinese replies", kind="Preference")`.
+`Memory.store()` accepts the same keyword. The caller selects the kind without an additional model call;
+omitting it retains `Fact`. Kind is independent of topic/entity type. Existing facts are not reclassified,
+and saving a Task does not create a reminder. Releases up to v1.0.3 do not accept this keyword.
 
 | Install | Purpose |
 |---|---|
