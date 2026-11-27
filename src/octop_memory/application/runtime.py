@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from octop_memory.application.config import (
     DEFAULT_RECALL_CFG,
     MemoryRuntimeConfig,
     coerce_runtime_config,
+    normalize_extraction_rule,
 )
 from octop_memory.application.host_files import HostFilesIndex
 from octop_memory.application.path_projection import (
@@ -312,6 +314,7 @@ class MemoryRuntime:
                 cache=self._recall_cache,
                 raw_policy=raw_policy,
                 atom_only=atom_only,
+                min_token_coverage=_coerce_ratio(recall_cfg.get("min_token_coverage")),
             )
             for snip in result.snippets:
                 hits.append(
@@ -399,7 +402,7 @@ class MemoryRuntime:
             **meta,
         }
 
-    def capture(self, params: dict[str, Any]) -> dict[str, Any]:
+    def capture(self, params: dict[str, Any], *, idempotent: bool = False) -> dict[str, Any]:
         """D52-C: TS ``agent_end`` hook → write raw events into SQLite.
 
         Params shape (mirrored by TS shell)::
@@ -433,7 +436,8 @@ class MemoryRuntime:
 
         capture_cfg = self._capture_cfg()
         privacy_cfg = self._privacy_cfg()
-        accepted = 0
+        source_keys: list[str] = []
+        skipped_tool_bytes = 0
         skipped_marker = 0
         skipped_short = 0
         skipped_role = 0
@@ -452,13 +456,16 @@ class MemoryRuntime:
                 event_type = "user_message"
             raw_payload = raw.get("payload")
             payload: dict[str, Any] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            if event_type == "tool_result":
+                # Older terminal clients labelled structured tool output as user text.
+                if not capture_cfg["include_tool_results"]:
+                    skipped_tool_result += 1
+                    skipped_tool_bytes += len(content.encode("utf-8", errors="replace"))
+                    continue
+                payload["role"] = "tool"
             role = _event_role(event_type, payload)
-
             if role not in capture_cfg["include_roles"]:
                 skipped_role += 1
-                continue
-            if role == "tool" and event_type == "tool_result" and not capture_cfg["include_tool_results"]:
-                skipped_tool_result += 1
                 continue
             # Strip reasoning blocks first so subsequent length / echo
             # checks see the user-visible body, not the model's scratchpad.
@@ -496,18 +503,49 @@ class MemoryRuntime:
             if privacy_cfg.get("store_raw_content") is False:
                 event.payload["content_redacted"] = True
             events_to_write.append(event)
-            accepted += 1
+            if idempotent:
+                # Keep the pre-redaction source key only for the hashed receipt.
+                source_keys.append(payload["octop_event_key"])
 
-        # Single batch write = single fsync regardless of event count.
-        if events_to_write:
+        accepted = len(events_to_write)
+        duplicates = 0
+        if events_to_write and idempotent:
+            if user is None or session_id is None:
+                raise ValueError("idempotent capture requires caller and session")
+            # Compare admitted bodies only under the same redaction settings.
+            policy = ""
+            if privacy_cfg != DEFAULT_PRIVACY_CFG:
+                policy = hashlib.sha256(json.dumps(privacy_cfg, sort_keys=True).encode()).hexdigest()
+            accepted, events_to_write = self._memory.capture_raw_batch(
+                user, session_id, events_to_write, source_keys, policy=policy
+            )
+            duplicates = len(source_keys) - accepted
+        elif events_to_write:
             self._memory.add_raw_batch(events_to_write)
 
         return {
             "accepted": accepted,
+            **({"skipped_duplicates": duplicates} if idempotent else {}),
+            **(
+                {
+                    "user_event_ids": [
+                        event.id
+                        for event in events_to_write
+                        if event.event_type == "user_message"
+                        and privacy_cfg.get("store_raw_content") is not False
+                        and not event.payload.get("content_redacted")
+                        and event.payload.get("turn_id") == params["evidence_for_turn"]
+                        and (not params.get("octop_model_review") or event.payload.get("octop_model_review"))
+                    ]
+                }
+                if params.get("evidence_for_turn")
+                else {}
+            ),
             "skipped_recall_marker": skipped_marker,
             "skipped_too_short": skipped_short,
             "skipped_role": skipped_role,
             "skipped_tool_result": skipped_tool_result,
+            "skipped_tool_result_bytes": skipped_tool_bytes,
             "skipped_runtime_error": skipped_runtime_error,
         }
 
@@ -635,7 +673,16 @@ class MemoryRuntime:
         if not new_events:
             return response
 
-        extractor = CandidateExtractor(llm=self._llm, max_candidates=max_candidates, max_tokens=max_tokens)
+        keep_rules = normalize_extraction_rule(extraction_cfg.get("keep_rules"))
+        skip_rules = normalize_extraction_rule(extraction_cfg.get("skip_rules"))
+
+        extractor = CandidateExtractor(
+            llm=self._llm,
+            max_candidates=max_candidates,
+            max_tokens=max_tokens,
+            keep_rules=keep_rules,
+            skip_rules=skip_rules,
+        )
         result = extractor.extract(new_events, session_id=session_id)
         response["warnings"] = result.warnings
         response["cap_warning"] = result.cap_warning
@@ -696,7 +743,12 @@ class MemoryRuntime:
         # are an enrichment layer, not load-bearing for atom recall.
         if self._llm_configured:
             try:
-                ep_extractor = EpisodeExtractor(llm=self._llm, max_tokens=max_tokens)
+                ep_extractor = EpisodeExtractor(
+                    llm=self._llm,
+                    max_tokens=max_tokens,
+                    keep_rules=keep_rules,
+                    skip_rules=skip_rules,
+                )
                 ep_result = ep_extractor.extract(new_events, session_id=session_id)
                 if ep_result.episodes:
                     self._memory.add_episodes(ep_result.episodes)
@@ -942,6 +994,17 @@ def _coerce_positive_int(value: Any, *, default: int, name: str) -> int:
     if ivalue < 1:
         raise ValueError(f"{name}: must be >= 1, got {ivalue}")
     return ivalue
+
+
+def _coerce_ratio(value: Any) -> float:
+    """Coerce a configured 0..1 ratio; anything unusable falls back to 0.0."""
+    if value is None:
+        return 0.0
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return ratio if 0.0 <= ratio <= 1.0 else 0.0
 
 
 def _coerce_positive_int_or_none(value: Any, *, name: str) -> int | None:

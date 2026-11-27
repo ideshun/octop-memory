@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, Self, runtime_checkable
 
@@ -38,6 +39,29 @@ class SearchIndexUpgradeRequired(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class CodexReviewEvidence:
+    event_id: str
+    timestamp: datetime
+    session_id: str
+    caller: str
+    turn_id: str
+    model: str | None
+    proposals: int
+
+    @property
+    def cursor(self) -> str:
+        # Both backends return UTC. Fixed-width timestamps and the raw ID also order tied events.
+        return f"{self.timestamp.isoformat(timespec='microseconds')}/{self.event_id}"
+
+
+@runtime_checkable
+class CodexReviewBackend(Protocol):
+    def latest_codex_review_evidence(self, caller: str | None = None) -> CodexReviewEvidence | None: ...
+
+    def advance_codex_review_cursor(self, cursor: str) -> None: ...
+
+
 @runtime_checkable
 class SearchIndexMaintenance(Protocol):
     """Optional maintenance capability of the built-in relational backends."""
@@ -69,6 +93,19 @@ class _Unset:
 
 
 _UNSET = _Unset()
+
+
+@runtime_checkable
+class RawCaptureBackend(Protocol):
+    def claim_capture_keys(
+        self, entries: dict[str, str], policy: str | None = None
+    ) -> dict[str, tuple[str, str | None]]:
+        """Reserve new keys and return the stored raw ID and privacy policy for conflicts."""
+        ...
+
+    def capture_history_pages(self, user: str, session: str) -> Iterator[list[RawEvent]]:
+        """Stream old raws in stable order inside the receipt transaction."""
+        ...
 
 
 @runtime_checkable
@@ -195,6 +232,10 @@ class MemoryBackend(Protocol):
         silently skipped.
         """
         ...
+
+    def codex_fact_targets(self, caller: str) -> list[dict[str, Any]]: ...
+    def append_codex_evidence(self, candidate: Candidate, atom: AtomCard | None, event_id: str, quote: str) -> None: ...
+    def retire_codex_draft(self, candidate_id: str, successor: str) -> bool: ...
 
     def save_candidate(self, candidate: Candidate) -> None:
         """Insert a new candidate. Re-inserting same id raises an error."""
