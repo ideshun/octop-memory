@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -17,7 +17,8 @@ from psycopg.types.json import Jsonb
 
 from octop_memory.domain.datetime import as_utc
 from octop_memory.domain.raw_search import IMAGE_BLOCK_TYPES, IMAGE_PAYLOAD_FIELDS, IMAGE_PLACEHOLDERS
-from octop_memory.storage.backends import _UNSET, SearchIndexUpgradeRequired, _Unset
+from octop_memory.storage.backends import _UNSET, CodexReviewEvidence, SearchIndexUpgradeRequired, _Unset
+from octop_memory.storage.backends.namespace import normalize_namespace
 from octop_memory.storage.backends.postgres_pool import acquire_pool
 from octop_memory.types import (
     ActiveEntity,
@@ -51,7 +52,7 @@ _RAW_SEARCH_INDEX = "raw_events_text_v1_fts"
 
 # Version of the shared-table layout, stamped into ``meta``. Bump when the
 # DDL below changes shape and add a corresponding migration.
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # Arbitrary constant identifying "octop-memory DDL" for pg_advisory_xact_lock,
 # so concurrent Memory instances (multiple agents / processes booting at once)
@@ -133,7 +134,7 @@ class PostgresMemoryBackend:
         dsn: str = "postgresql://localhost/octop_memory",
         **kwargs: Any,
     ) -> None:
-        self._ns = re.sub(r"[^a-z0-9_]", "_", namespace.lower())
+        self._ns = normalize_namespace(namespace)
         self._dsn = dsn
         self._connect_kwargs = dict(kwargs)
         self._conn: Any = None  # only held while an operation/transaction owns it
@@ -286,6 +287,15 @@ class PostgresMemoryBackend:
                     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                     content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
                     PRIMARY KEY (namespace, id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS raw_capture_keys (
+                    namespace TEXT NOT NULL,
+                    capture_key TEXT NOT NULL,
+                    raw_id TEXT NOT NULL,
+                    policy TEXT,
+                    PRIMARY KEY (namespace, capture_key)
                 )
             """)
             _ensure_index(
@@ -977,7 +987,7 @@ class PostgresMemoryBackend:
             postgres_legacy.mark_purged(cur, self._ns)
             # Children before parents: memory_nodes self-FK is the only one.
             cur.execute("SET CONSTRAINTS ALL DEFERRED")
-            for table in _TABLES:
+            for table in ("raw_capture_keys", *_TABLES):
                 cur.execute(f"DELETE FROM {table} WHERE namespace = %s", (self._ns,))
                 total += _rowcount(cur.rowcount)
         return total
@@ -1235,6 +1245,37 @@ class PostgresMemoryBackend:
                 rows,
             )
 
+    def claim_capture_keys(
+        self, entries: dict[str, str], policy: str | None = None
+    ) -> dict[str, tuple[str, str | None]]:
+        if not entries:
+            return {}
+        with self._cursor() as cur:
+            cur.execute(
+                """INSERT INTO raw_capture_keys (namespace, capture_key, raw_id, policy)
+                   SELECT %s, k, v, %s FROM unnest(%s::text[], %s::text[]) AS t(k,v) ORDER BY k
+                   ON CONFLICT (namespace, capture_key) DO NOTHING RETURNING capture_key""",
+                (self._ns, policy, list(entries), list(entries.values())),
+            )
+            conflicts = entries.keys() - {row["capture_key"] for row in cur.fetchall()}
+            if not conflicts:
+                return {}
+            cur.execute(
+                "SELECT capture_key, raw_id, policy FROM raw_capture_keys "
+                "WHERE namespace = %s AND capture_key = ANY(%s)",
+                (self._ns, list(conflicts)),
+            )
+            return {row["capture_key"]: (row["raw_id"], row["policy"]) for row in cur.fetchall()}
+
+    def capture_history_pages(self, user: str, session: str) -> Iterator[list[RawEvent]]:
+        with self.transaction(), self._connection() as conn, conn.cursor(name="raw_capture_backfill") as cur:
+            cur.execute(
+                'SELECT * FROM raw_events WHERE namespace = %s AND "user" = %s AND session_id = %s ORDER BY id',
+                (self._ns, user, session),
+            )
+            while rows := cur.fetchmany(200):
+                yield [self._row_to_raw(row) for row in rows]
+
     def get_raw(self, event_id: str) -> RawEvent | None:
         with self._cursor() as cur:
             cur.execute(
@@ -1363,6 +1404,57 @@ class PostgresMemoryBackend:
             if existing and frozenset(existing) == target_ids:
                 return True
         return False
+
+    def codex_fact_targets(self, caller: str) -> list[dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(
+                """SELECT c.id AS candidate_id, coalesce(a.id,c.id) AS target_id,
+                   c.assertion AS candidate_assertion, coalesce(a.assertion,c.assertion) AS assertion,
+               c.payload->>'scope' AS scope,
+                   c.payload->>'aspect' AS aspect, c.payload->>'value' AS value, c.status, a.id AS atom_id
+            FROM candidates c JOIN raw_events r ON r.id=c.quote_event_id AND r.namespace=c.namespace
+            LEFT JOIN atoms a ON a.candidate_id=c.id AND a.namespace=c.namespace
+            WHERE c.namespace = %s AND ((r."user"=%s AND r.host='codex') OR (r.host='manual'
+                 AND r."user" IS NULL AND r.event_type='manual' AND r.payload->'metadata'->>'caller'=%s))
+              AND ((a.id IS NULL AND c.status IN ('pending','needs_review'))
+                OR (a.id IS NOT NULL AND a.deprecated_at IS NULL))
+            ORDER BY c.created_at DESC""",
+                (self._ns, caller, caller),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def append_codex_evidence(self, candidate: Candidate, atom: AtomCard | None, event_id: str, quote: str) -> None:
+        with self._cursor() as cur:
+            if event_id in candidate.raw_event_ids:
+                return
+            refs = [*candidate.raw_event_ids, event_id]
+            quotes = dict(candidate.payload.get("evidence_quotes") or {})
+            quotes.setdefault(candidate.quote_event_id, candidate.verbatim_quote)
+            quotes[event_id] = quote
+            payload = {**candidate.payload, "evidence_quotes": quotes}
+            cur.execute(
+                "UPDATE candidates SET raw_event_ids=%s, payload=%s WHERE namespace = %s AND id=%s AND status=%s",
+                (Jsonb(refs), Jsonb(payload), self._ns, candidate.id, candidate.status),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("candidate was reviewed concurrently")
+            if atom is not None:
+                atom_refs = list(dict.fromkeys([*atom.raw_event_ids, event_id]))
+                cur.execute(
+                    "UPDATE atoms SET raw_event_ids=%s WHERE namespace = %s AND id=%s AND deprecated_at IS NULL",
+                    (Jsonb(atom_refs), self._ns, atom.id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("memory was updated concurrently")
+
+    def retire_codex_draft(self, candidate_id: str, successor: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE candidates SET status='rejected', promotion_reason=%s, decided_by='rule', decided_at=%s"
+                " WHERE namespace = %s AND id=%s AND status IN ('needs_review','pending','conflict')",
+                (f"superseded by {successor}", datetime.now(UTC), self._ns, candidate_id),
+            )
+            return bool(cur.rowcount == 1)
 
     def save_candidate(self, candidate: Candidate) -> None:
         """Insert a new candidate. Strict insert; duplicate id → UniqueViolation."""
@@ -2069,6 +2161,45 @@ class PostgresMemoryBackend:
             )
             row = cur.fetchone()
         return self._row_to_entity_page(row) if row else None
+
+    def latest_codex_review_evidence(self, caller: str | None = None) -> CodexReviewEvidence | None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                WITH latest AS (
+                    SELECT namespace, id AS event_id, timestamp, session_id, "user" AS caller,
+                           payload->>'turn_id' AS turn_id, payload->>'source_model' AS model
+                    FROM raw_events
+                    WHERE namespace = %s AND host = 'codex' AND event_type = 'user_message'
+                      AND (%s::text IS NULL OR "user" = %s)
+                      AND session_id IS NOT NULL AND "user" IS NOT NULL AND payload->>'turn_id' != ''
+                      AND (payload->>'codex_review' = 'true' OR payload->>'source_model' != '')
+                      AND payload->>'content_redacted' IS DISTINCT FROM 'true'
+                    ORDER BY timestamp DESC, id DESC LIMIT 1
+                )
+                SELECT event_id, timestamp, session_id, caller, turn_id, model, (
+                    SELECT count(*) FROM candidates c JOIN raw_events r
+                      ON r.namespace = c.namespace AND r.id = c.quote_event_id
+                    WHERE c.namespace = latest.namespace AND c.extractor_version IN ('host-quote/v1', 'host-facts/v2')
+                      AND c.session_id = latest.session_id AND r.session_id = latest.session_id
+                      AND r."user" = latest.caller AND r.host = 'codex' AND r.payload->>'turn_id' = latest.turn_id
+                ) AS proposals FROM latest
+            """,
+                (self._ns, caller, caller),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return CodexReviewEvidence(**{**row, "timestamp": as_utc(row["timestamp"])})
+
+    def advance_codex_review_cursor(self, cursor: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """INSERT INTO meta (key, value) VALUES (%s, %s)
+                   ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+                   WHERE EXCLUDED.value COLLATE "C" > meta.value COLLATE "C" """,
+                (self._meta_key("codex_review_finished"), cursor),
+            )
 
     def count_stats(self) -> dict[str, int]:
         out: dict[str, int] = {}
